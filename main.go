@@ -22,7 +22,7 @@ func main() {
 	go service.K8sService.CheckAndBootDeployment()
 
 	for {
-		time.Sleep(5000 * time.Millisecond)
+		time.Sleep(10000 * time.Millisecond)
 		service.K8sService.Run()
 	}
 

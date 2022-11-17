@@ -1,6 +1,10 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  annotations:
+    scheduler.enable: "true"
+    scheduler.startup: "09:00"
+    scheduler.shutdown: "21:00"
   name: test-server
   labels:
     app: test-server

@@ -8,6 +8,8 @@ import (
 	"k8sOp/channel"
 	"log"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -21,6 +23,8 @@ type k8sService struct {
 	ctx       context.Context
 	clientset *kubernetes.Clientset
 }
+
+const targetDir string = "/home/server/apply"
 
 var K8sService k8sService = k8sService{nil, nil}
 
@@ -51,31 +55,104 @@ func (c *k8sService) Run() {
 	var now = time.Now().UTC()
 	now = now.In(time.FixedZone("KST", 9*60*60))
 	hour := now.Hour()
-	if hour >= 8 && hour < 21 {
-		c.createDeployments("test-server", "./testServer.yaml")
-	} else if hour >= 21 {
-		deploymentClient := c.clientset.AppsV1().Deployments("default")
-		deployments, err := deploymentClient.List(context.TODO(), metav1.ListOptions{})
+	minute := now.Minute()
+
+	c.createDeploymentsAll(hour, minute)
+	c.deleteDeployments(hour, minute)
+
+}
+
+func (c *k8sService) deleteDeployments(hour int, minute int) {
+	deploymentClient := c.clientset.AppsV1().Deployments("default")
+	deployments, err := deploymentClient.List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		panic(err)
+	}
+	for _, deployment := range deployments.Items {
+		if enable, exist := deployment.Annotations["scheduler.enable"]; !exist || enable != "true" {
+			continue
+		}
+		if time, exist := deployment.Annotations["scheduler.shutdown"]; exist {
+			times := strings.Split(time, ":")
+			parseHour, err := strconv.ParseInt(times[0], 10, 64)
+			if err != nil {
+				continue
+			}
+			parseMinute, _ := strconv.ParseInt(times[1], 10, 64)
+			if err != nil {
+				continue
+			}
+			if parseHour == int64(hour) && parseMinute == int64(minute) {
+				deletePolicy := metav1.DeletePropagationForeground
+				if err := deploymentClient.Delete(context.TODO(), deployment.Name, metav1.DeleteOptions{
+					PropagationPolicy: &deletePolicy,
+				}); err != nil {
+					continue
+				}
+				deployment.ResourceVersion = ""
+				deployment.UID = ""
+				c.deleteFileByDeploymentName(deployment.Name)
+				c.createDeploymentFile(&deployment)
+				fmt.Println("Deleted deployment: " + deployment.Name)
+			}
+		}
+	}
+}
+
+func (c *k8sService) createDeploymentsAll(hour int, minute int) {
+	deploymentClient := c.clientset.AppsV1().Deployments("default")
+	files, err := ioutil.ReadDir(targetDir)
+	if err != nil {
+		panic(err)
+	}
+	for _, fileInfo := range files {
+		file, err := os.Open(targetDir + "/" + fileInfo.Name())
 		if err != nil {
 			panic(err)
 		}
-		for _, deployment := range deployments.Items {
-			if deployment.Name == "scheduler" || deployment.Name == "proxy-server" {
-				continue
+		defer file.Close()
+
+		b, err := ioutil.ReadAll(file)
+		if err != nil {
+			panic(err)
+		}
+
+		deployemntJson, err := yaml.YAMLToJSON(b)
+		if err != nil {
+			fmt.Printf("err: %v\n", err)
+			continue
+		}
+		dep := &appsv1.Deployment{}
+		json.Unmarshal(deployemntJson, &dep)
+		if enable, exist := dep.Annotations["scheduler.enable"]; exist && enable == "true" {
+			if time, exist := dep.Annotations["scheduler.startup"]; exist {
+				existDeploy, _ := deploymentClient.Get(context.TODO(), dep.Name, metav1.GetOptions{})
+				if existDeploy == nil {
+					continue
+				}
+				times := strings.Split(time, ":")
+				parseHour, err := strconv.ParseInt(times[0], 10, 64)
+				if err != nil {
+					continue
+				}
+				parseMinute, _ := strconv.ParseInt(times[1], 10, 64)
+				if err != nil {
+					continue
+				}
+				if parseHour == int64(hour) && parseMinute == int64(minute) {
+					result, err := deploymentClient.Create(context.TODO(), dep, metav1.CreateOptions{})
+					if err != nil {
+						fmt.Printf("create %v", err)
+					}
+					fmt.Printf("Created deployment %q.\n", result.GetObjectMeta().GetName())
+				}
 			}
-			deletePolicy := metav1.DeletePropagationForeground
-			if err := deploymentClient.Delete(context.TODO(), deployment.Name, metav1.DeleteOptions{
-				PropagationPolicy: &deletePolicy,
-			}); err != nil {
-				panic(err)
-			}
-			fmt.Println("Deleted deployment: " + deployment.Name)
 		}
 	}
 
 }
 
-func (c *k8sService) createDeployments(name string, fileName string) {
+func (c *k8sService) createDeployments(name string) {
 	deploymentClient := c.clientset.AppsV1().Deployments("default")
 
 	deployments, err := deploymentClient.List(context.TODO(), metav1.ListOptions{})
@@ -90,10 +167,36 @@ func (c *k8sService) createDeployments(name string, fileName string) {
 	}
 
 	if !find {
-		file, err := os.Open(fileName)
+		dep := c.findDeploymentFromFileByDeploymentName(name)
+		if dep == nil {
+			return
+		}
+		result, err := deploymentClient.Create(context.TODO(), dep, metav1.CreateOptions{})
+		if err != nil {
+			fmt.Printf("create %v", err)
+		}
+		fmt.Printf("Created deployment %q.\n", result.GetObjectMeta().GetName())
+	}
+}
+func (c *k8sService) createDeploymentFile(deployment *appsv1.Deployment) {
+	deployemntJson, err := json.Marshal(deployment)
+	if err != nil {
+		return
+	}
+	b, _ := yaml.JSONToYAML(deployemntJson)
+	ioutil.WriteFile(targetDir+"/"+deployment.Name+".yaml", b, 0777)
+}
+func (c *k8sService) deleteFileByDeploymentName(appName string) {
+	files, err := ioutil.ReadDir(targetDir)
+	if err != nil {
+		panic(err)
+	}
+	for _, fileInfo := range files {
+		file, err := os.Open(targetDir + "/" + fileInfo.Name())
 		if err != nil {
 			panic(err)
 		}
+		defer file.Close()
 
 		b, err := ioutil.ReadAll(file)
 		if err != nil {
@@ -106,16 +209,46 @@ func (c *k8sService) createDeployments(name string, fileName string) {
 			return
 		}
 		dep := &appsv1.Deployment{}
-		// dep.Unmarshal(deployemntJson)
 		json.Unmarshal(deployemntJson, &dep)
-		fmt.Println(string(deployemntJson))
+		if dep.Name == appName {
+			os.Remove(targetDir + "/" + fileInfo.Name())
+			return
+		}
+	}
+}
 
-		result, err := deploymentClient.Create(context.TODO(), dep, metav1.CreateOptions{})
+func (c *k8sService) findDeploymentFromFileByDeploymentName(appName string) *appsv1.Deployment {
+	files, err := ioutil.ReadDir(targetDir)
+	if err != nil {
+		panic(err)
+	}
+	for _, fileInfo := range files {
+		file, err := os.Open(targetDir + "/" + fileInfo.Name())
 		if err != nil {
 			panic(err)
 		}
-		fmt.Printf("Created deployment %q.\n", result.GetObjectMeta().GetName())
+		defer file.Close()
+
+		b, err := ioutil.ReadAll(file)
+		if err != nil {
+			panic(err)
+		}
+
+		deployemntJson, err := yaml.YAMLToJSON(b)
+		if err != nil {
+			fmt.Printf("err: %v\n", err)
+			return nil
+		}
+		dep := &appsv1.Deployment{}
+		json.Unmarshal(deployemntJson, &dep)
+		if dep.Name == appName {
+			if enable, exist := dep.Annotations["scheduler.enable"]; !exist || enable != "true" {
+				return nil
+			}
+			return dep
+		}
 	}
+	return nil
 }
 
 func (c *k8sService) CheckAndBootDeployment() {
@@ -126,7 +259,7 @@ func (c *k8sService) CheckAndBootDeployment() {
 			panic(err)
 		}
 		appName := service.Spec.Selector["app"]
-		c.createDeployments(appName, "./testServer.yaml")
+		c.createDeployments(appName)
 	}
 
 }
